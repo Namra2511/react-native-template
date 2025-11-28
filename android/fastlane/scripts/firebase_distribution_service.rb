@@ -52,7 +52,11 @@ class FirebaseDistributionService
     UI.user_error!("❌ Version not found in package.json") unless version
 
     major, minor, patch = version.split('.').map(&:to_i)
-    version_code = (major * 10000) + (minor * 100) + patch
+    # Include PR number in version code for guaranteed uniqueness across concurrent PRs
+    # Format: (major * 1000000) + (minor * 10000) + (patch * 100) + pr_number
+    # This allows up to 99 PRs per version, 99 patches per minor, etc.
+    # Example: version 1.0.2, PR #5 → version_code = 1000205
+    version_code = (major * 1000000) + (minor * 10000) + (patch * 100) + pr_number.to_i
 
     ENV["GRADLE_OPTS"] = "-Xmx6g -XX:MaxMetaspaceSize=2g -Dfile.encoding=UTF-8"
 
