@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     outputs:
       bumped: ${{ steps.bump_state.outputs.bumped }}
     steps:
@@ -33,13 +34,114 @@ jobs:
           BASE_VERSION=$(git show origin/main:package.json | jq -r .version)
           echo "BASELINE_VERSION=${BASE_VERSION}" >> "$GITHUB_ENV"
 
+      - name: Find highest version from open PRs and main
+        id: find_max_version
+        run: |
+          MAX_VERSION=$(node - <<'EOF'
+            const https = require('https');
+            const { execSync } = require('child_process');
+            const token = process.env.GITHUB_TOKEN;
+            const repo = process.env.GITHUB_REPOSITORY;
+            const currentPR = parseInt(process.env.GITHUB_EVENT_NUMBER || '0');
+            const currentBranch = process.env.CURRENT_BRANCH;
+            const baseVersion = process.env.BASELINE_VERSION || '0.0.0';
+            
+            const parse = (v) => v.split('.').map(Number);
+            const cmp = (a, b) => {
+              for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+                const left = a[i] ?? 0;
+                const right = b[i] ?? 0;
+                if (left !== right) return left - right;
+              }
+              return 0;
+            };
+            
+            const fetchOpenPRs = () => {
+              return new Promise((resolve, reject) => {
+                const options = {
+                  hostname: 'api.github.com',
+                  path: `/repos/${repo}/pulls?state=open&per_page=100`,
+                  method: 'GET',
+                  headers: {
+                    'User-Agent': 'GitHub-Actions',
+                    'Authorization': `token ${token}`,
+                    'Accept': 'application/vnd.github.v3+json'
+                  }
+                };
+                
+                https.get(options, (res) => {
+                  let data = '';
+                  res.on('data', (chunk) => { data += chunk; });
+                  res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                      reject(new Error(`GitHub API error: ${res.statusCode}`));
+                      return;
+                    }
+                    resolve(JSON.parse(data));
+                  });
+                }).on('error', reject);
+              });
+            };
+            
+            (async () => {
+              try {
+                // Start with main branch version
+                const versions = [baseVersion];
+                const prs = await fetchOpenPRs();
+                
+                execSync('git fetch origin --prune', { stdio: 'ignore' });
+                
+                // Check all open PRs for their versions
+                for (const pr of prs) {
+                  if (pr.number === currentPR || pr.draft || pr.state !== 'open') continue;
+                  
+                  try {
+                    const branchRef = `origin/${pr.head.ref}`;
+                    const versionContent = execSync(`git show ${branchRef}:package.json 2>/dev/null || echo ""`, { encoding: 'utf8' });
+                    if (versionContent) {
+                      try {
+                        const pkg = JSON.parse(versionContent);
+                        if (pkg.version) {
+                          versions.push(pkg.version);
+                        }
+                      } catch (e) {
+                        // Invalid JSON, skip
+                      }
+                    }
+                  } catch (e) {
+                    // Branch doesn't exist or can't read package.json, skip
+                  }
+                }
+                
+                // Find the highest version
+                versions.sort((a, b) => -cmp(parse(a), parse(b)));
+                const maxVersion = versions[0];
+                
+                // Note: Even if versions collide, PR number in version code ensures uniqueness
+                // This step ensures sequential versioning for cleaner main branch history
+                process.stdout.write(maxVersion);
+              } catch (error) {
+                console.error('Error checking PR versions:', error.message);
+                process.stdout.write(baseVersion);
+              }
+            })();
+          EOF
+          )
+          echo "MAX_VERSION=${MAX_VERSION}" >> "$GITHUB_ENV"
+          echo "Using baseline version: ${MAX_VERSION} (PR number in version code ensures build uniqueness)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          CURRENT_BRANCH: ${{ github.head_ref }}
+
       - name: Determine if bump already applied
         id: evaluate
         run: |
           NEEDS=$(node - <<'EOF'
             const fs = require('fs');
             const pkgVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
-            const baseVersion = process.env.BASELINE_VERSION || pkgVersion;
+            const baseVersion = process.env.MAX_VERSION || process.env.BASELINE_VERSION || pkgVersion;
             const parse = (v) => v.split('.').map(Number);
             const cmp = (a, b) => {
               for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
@@ -63,7 +165,7 @@ jobs:
             const fs = require('fs');
             const path = 'package.json';
             const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const baseline = process.env.BASELINE_VERSION || pkg.version;
+            const baseline = process.env.MAX_VERSION || process.env.BASELINE_VERSION || pkg.version;
             const parse = (v) => v.split('.').map(Number);
             const cmp = (a, b) => {
               for (let i = 0; i < Math.max(a.length, b.length); i += 1) {

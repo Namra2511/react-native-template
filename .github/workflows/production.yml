@@ -10,13 +10,102 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate_and_correct_version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      corrected_version: ${{ steps.correct.outputs.version }}
+      version_was_corrected: ${{ steps.correct.outputs.corrected }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate and correct version for sequential ordering
+        id: correct
+        run: |
+          CURRENT_VERSION=$(jq -r .version package.json)
+          echo "Current version on main: ${CURRENT_VERSION}"
+          
+          # Get the previous commit's version (before this merge)
+          PREVIOUS_VERSION=$(git show HEAD~1:package.json 2>/dev/null | jq -r .version || echo "0.0.0")
+          echo "Previous version on main: ${PREVIOUS_VERSION}"
+          
+          RESULT=$(node - <<EOF
+            const fs = require('fs');
+            const current = '${CURRENT_VERSION}';
+            const previous = '${PREVIOUS_VERSION}';
+            
+            const parse = (v) => v.split('.').map(Number);
+            const cmp = (a, b) => {
+              for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+                const left = a[i] ?? 0;
+                const right = b[i] ?? 0;
+                if (left !== right) return left - right;
+              }
+              return 0;
+            };
+            
+            const currentParts = parse(current);
+            const previousParts = parse(previous);
+            
+            // Calculate what the next sequential version should be
+            const nextParts = [...previousParts];
+            nextParts[2] = (nextParts[2] ?? 0) + 1;
+            const nextVersion = nextParts.join('.');
+            
+            // If current version is not sequential, correct it
+            if (cmp(currentParts, nextParts) !== 0) {
+              const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+              pkg.version = nextVersion;
+              fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\\n');
+              
+              // Create release notes if missing
+              const notesFile = \`docs/release_notes/\${nextVersion}.md\`;
+              if (!fs.existsSync(notesFile)) {
+                fs.mkdirSync('docs/release_notes', { recursive: true });
+                fs.writeFileSync(notesFile, \`# Release notes for \${nextVersion}\n\n- TODO: Describe changes included in this release.\n\`);
+              }
+              
+              console.log(\`Version corrected from \${current} to \${nextVersion}\`);
+              console.log(\`VERSION=\${nextVersion}\`);
+              console.log(\`CORRECTED=true\`);
+            } else {
+              console.log(\`Version \${current} is already sequential\`);
+              console.log(\`VERSION=\${current}\`);
+              console.log(\`CORRECTED=false\`);
+            }
+          EOF
+          )
+          
+          VERSION=$(echo "$RESULT" | grep "^VERSION=" | cut -d'=' -f2)
+          CORRECTED=$(echo "$RESULT" | grep "^CORRECTED=" | cut -d'=' -f2)
+          
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "corrected=${CORRECTED}" >> "$GITHUB_OUTPUT"
+          
+          if [ "${CORRECTED}" == "true" ]; then
+            echo "Version was corrected from ${CURRENT_VERSION} to ${VERSION}, committing fix..."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add package.json docs/release_notes/
+            git commit -m "chore: correct version to ${VERSION} to maintain sequential ordering [auto-version-fix]"
+            git push origin main
+            echo "✅ Version corrected and pushed"
+          else
+            echo "✅ Version ${VERSION} is already sequential, no correction needed"
+          fi
+
   release_notes_check:
+    needs: validate_and_correct_version
     runs-on: ubuntu-latest
     outputs:
       release_notes: ${{ steps.check.outputs.release_notes }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Check release notes
         id: check
@@ -28,7 +117,7 @@ jobs:
 
   deploy_android:
     runs-on: ubuntu-latest
-    needs: [release_notes_check]
+    needs: [validate_and_correct_version, release_notes_check]
     steps:
       - name: Checkout (app)
         uses: actions/checkout@v3
