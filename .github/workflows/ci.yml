@@ -9,163 +9,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
   auto_version_bump:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: read
-    outputs:
-      bumped: ${{ steps.bump_state.outputs.bumped }}
+    if: github.event.pull_request.state == 'open' && github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Initialize state
-        run: echo "AUTO_BUMPED=false" >> "$GITHUB_ENV"
 
       - name: Ensure branch is up to date with main
         run: |
           git fetch origin main --depth=1
           if ! git merge-base --is-ancestor origin/main HEAD; then
-            echo "::error::This branch is behind main. Please rebase or merge the latest main before pushing."
+            echo "::error::This branch is behind main. Please rebase or merge the latest main, then push again."
             exit 1
           fi
           BASE_VERSION=$(git show origin/main:package.json | jq -r .version)
           echo "BASELINE_VERSION=${BASE_VERSION}" >> "$GITHUB_ENV"
 
-      - name: Find highest version from open PRs and main
-        id: find_max_version
+      - name: Auto bump patch version and rename release notes
         run: |
-          MAX_VERSION=$(node - <<'EOF'
-            const https = require('https');
-            const { execSync } = require('child_process');
-            const token = process.env.GITHUB_TOKEN;
-            const repo = process.env.GITHUB_REPOSITORY;
-            const currentPR = parseInt(process.env.GITHUB_EVENT_NUMBER || '0');
-            const currentBranch = process.env.CURRENT_BRANCH;
-            const baseVersion = process.env.BASELINE_VERSION || '0.0.0';
-            
-            const parse = (v) => v.split('.').map(Number);
-            const cmp = (a, b) => {
-              for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
-                const left = a[i] ?? 0;
-                const right = b[i] ?? 0;
-                if (left !== right) return left - right;
-              }
-              return 0;
-            };
-            
-            const fetchOpenPRs = () => {
-              return new Promise((resolve, reject) => {
-                const options = {
-                  hostname: 'api.github.com',
-                  path: `/repos/${repo}/pulls?state=open&per_page=100`,
-                  method: 'GET',
-                  headers: {
-                    'User-Agent': 'GitHub-Actions',
-                    'Authorization': `token ${token}`,
-                    'Accept': 'application/vnd.github.v3+json'
-                  }
-                };
-                
-                https.get(options, (res) => {
-                  let data = '';
-                  res.on('data', (chunk) => { data += chunk; });
-                  res.on('end', () => {
-                    if (res.statusCode !== 200) {
-                      reject(new Error(`GitHub API error: ${res.statusCode}`));
-                      return;
-                    }
-                    resolve(JSON.parse(data));
-                  });
-                }).on('error', reject);
-              });
-            };
-            
-            (async () => {
-              try {
-                // Start with main branch version
-                const versions = [baseVersion];
-                const prs = await fetchOpenPRs();
-                
-                execSync('git fetch origin --prune', { stdio: 'ignore' });
-                
-                // Check all open PRs for their versions
-                for (const pr of prs) {
-                  if (pr.number === currentPR || pr.draft || pr.state !== 'open') continue;
-                  
-                  try {
-                    const branchRef = `origin/${pr.head.ref}`;
-                    const versionContent = execSync(`git show ${branchRef}:package.json 2>/dev/null || echo ""`, { encoding: 'utf8' });
-                    if (versionContent) {
-                      try {
-                        const pkg = JSON.parse(versionContent);
-                        if (pkg.version) {
-                          versions.push(pkg.version);
-                        }
-                      } catch (e) {
-                        // Invalid JSON, skip
-                      }
-                    }
-                  } catch (e) {
-                    // Branch doesn't exist or can't read package.json, skip
-                  }
-                }
-                
-                // Find the highest version
-                versions.sort((a, b) => -cmp(parse(a), parse(b)));
-                const maxVersion = versions[0];
-                
-                // Note: Even if versions collide, PR number in version code ensures uniqueness
-                // This step ensures sequential versioning for cleaner main branch history
-                process.stdout.write(maxVersion);
-              } catch (error) {
-                console.error('Error checking PR versions:', error.message);
-                process.stdout.write(baseVersion);
-              }
-            })();
-          EOF
-          )
-          echo "MAX_VERSION=${MAX_VERSION}" >> "$GITHUB_ENV"
-          echo "Using baseline version: ${MAX_VERSION} (PR number in version code ensures build uniqueness)"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_EVENT_NUMBER: ${{ github.event.pull_request.number }}
-          CURRENT_BRANCH: ${{ github.head_ref }}
+          CURRENT_VERSION=$(jq -r .version package.json)
+          echo "Current PR version: ${CURRENT_VERSION}"
+          echo "Baseline (main) version: ${BASELINE_VERSION}"
 
-      - name: Determine if bump already applied
-        id: evaluate
-        run: |
-          NEEDS=$(node - <<'EOF'
-            const fs = require('fs');
-            const pkgVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
-            const baseVersion = process.env.MAX_VERSION || process.env.BASELINE_VERSION || pkgVersion;
-            const parse = (v) => v.split('.').map(Number);
-            const cmp = (a, b) => {
-              for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
-                const left = a[i] ?? 0;
-                const right = b[i] ?? 0;
-                if (left !== right) return left - right;
-              }
-              return 0;
-            };
-            const needs = cmp(parse(pkgVersion), parse(baseVersion)) <= 0 ? 'true' : 'false';
-            process.stdout.write(needs);
-          EOF
-          )
-          echo "needs=${NEEDS}" >> "$GITHUB_OUTPUT"
-
-      - name: Bump patch version in package.json
-        if: steps.evaluate.outputs.needs == 'true'
-        id: bump
-        run: |
           NEW_VERSION=$(node - <<'EOF'
             const fs = require('fs');
-            const path = 'package.json';
-            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const baseline = process.env.MAX_VERSION || process.env.BASELINE_VERSION || pkg.version;
+            const base = process.env.BASELINE_VERSION;
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const current = pkg.version;
+
             const parse = (v) => v.split('.').map(Number);
             const cmp = (a, b) => {
               for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
@@ -175,74 +52,80 @@ jobs:
               }
               return 0;
             };
-            const pkgParts = parse(pkg.version);
-            const baseParts = parse(baseline);
-            const source = cmp(pkgParts, baseParts) >= 0 ? pkgParts : baseParts;
-            source[2] = (source[2] ?? 0) + 1;
-            pkg.version = source.join('.');
-            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
-            process.stdout.write(pkg.version);
+
+            if (!base) {
+              console.error('Missing BASELINE_VERSION');
+              process.exit(1);
+            }
+
+            const baseParts = parse(base);
+            const currParts = parse(current);
+
+            const ordering = cmp(currParts, baseParts);
+
+            // If PR version is already ahead of main, keep it (no bump)
+            if (ordering > 0) {
+              console.log(current);
+              process.exit(0);
+            }
+
+            // If PR version is below main, fail with guidance
+            if (ordering < 0) {
+              console.error(`PR version ${current} is below main ${base}. Please set package.json version back to ${base} (or above) and push again.`);
+              process.exit(1);
+            }
+
+            // current == base → bump patch
+            const nextParts = [...baseParts];
+            nextParts[2] = (nextParts[2] ?? 0) + 1;
+            const next = nextParts.join('.');
+
+            pkg.version = next;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+            console.log(next);
           EOF
           )
-          echo "Auto-bumped version to ${NEW_VERSION}"
-          git status --short package.json
-          echo "AUTO_VERSION=${NEW_VERSION}" >> "$GITHUB_ENV"
-          NOTES_FILE="docs/release_notes/${NEW_VERSION}.md"
-          echo "RELEASE_NOTES_FILE=${NOTES_FILE}" >> "$GITHUB_ENV"
-          if [ ! -f "${NOTES_FILE}" ]; then
-            mkdir -p "$(dirname "${NOTES_FILE}")"
+
+          if [ -z "${NEW_VERSION}" ]; then
+            echo "::error::Failed to compute new version."
+            exit 1
+          fi
+
+          echo "New version (after bump logic): ${NEW_VERSION}"
+
+          if [ "${NEW_VERSION}" = "${CURRENT_VERSION}" ]; then
+            echo "Version already ahead of main, no bump or rename needed."
+            exit 0
+          fi
+
+          OLD_NOTES_FILE="docs/release_notes/${CURRENT_VERSION}.md"
+          NEW_NOTES_FILE="docs/release_notes/${NEW_VERSION}.md"
+
+          if [ -f "${OLD_NOTES_FILE}" ] && [ ! -f "${NEW_NOTES_FILE}" ]; then
+            echo "Renaming release notes ${OLD_NOTES_FILE} -> ${NEW_NOTES_FILE}"
+            git mv "${OLD_NOTES_FILE}" "${NEW_NOTES_FILE}"
+          elif [ -f "${NEW_NOTES_FILE}" ]; then
+            echo "Release notes file for ${NEW_VERSION} already exists at ${NEW_NOTES_FILE}, leaving as is."
+          else
+            echo "No existing release-notes file for ${CURRENT_VERSION}, creating stub for ${NEW_VERSION}."
+            mkdir -p "$(dirname "${NEW_NOTES_FILE}")"
             {
               echo "# Release notes for ${NEW_VERSION}"
               echo
               echo "- TODO: Describe changes included in this release."
-            } > "${NOTES_FILE}"
-            echo "Created stub release-notes file at ${NOTES_FILE}"
-          else
-            echo "Release-notes file already exists at ${NOTES_FILE}, leaving as is."
+            } > "${NEW_NOTES_FILE}"
           fi
 
-      - name: Commit version bump
-        if: steps.evaluate.outputs.needs == 'true'
-        run: |
-          if git diff --quiet -- package.json; then
-            echo "::error::Version bump did not modify package.json"
+          if git diff --quiet -- package.json docs/release_notes/; then
+            echo "::error::Expected version bump or release-notes change, but no changes were detected."
             exit 1
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "${RELEASE_NOTES_FILE:-}" ] && [ -f "${RELEASE_NOTES_FILE}" ]; then
-            git add package.json "${RELEASE_NOTES_FILE}"
-          else
-            git add package.json
-          fi
-          COMMIT_MSG="chore: auto bump version to ${AUTO_VERSION:-$(jq -r .version package.json)} [auto-bump]"
-          git commit -m "${COMMIT_MSG}"
-
-      - name: Push auto bump commit
-        if: steps.evaluate.outputs.needs == 'true'
-        run: |
-          set +e
+          git add package.json docs/release_notes/
+          git commit -m "chore: auto bump version to ${NEW_VERSION} [auto-bump]"
           git push origin HEAD:${{ github.head_ref }}
-          status=$?
-          set -e
-          if [ $status -eq 0 ]; then
-            echo "AUTO_BUMPED=true" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          echo "Push failed, checking for existing auto bump commit..."
-          git fetch origin ${{ github.head_ref }}
-          git reset --hard origin/${{ github.head_ref }}
-          LAST_MSG="$(git log -1 --pretty=%B)"
-          if [[ "$LAST_MSG" == *"[auto-bump]"* ]]; then
-            echo "AUTO_BUMPED=true" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          echo "::error::Auto version bump push failed. Please resolve manually."
-          exit 1
-
-      - name: Emit bump state
-        id: bump_state
-        run: echo "bumped=${AUTO_BUMPED:-false}" >> "$GITHUB_OUTPUT"
 
   release_notes_check:
     needs: auto_version_bump
