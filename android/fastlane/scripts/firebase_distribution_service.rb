@@ -43,20 +43,14 @@ class FirebaseDistributionService
   # - Daemon disabled (stateless)
   # - Limited workers to reduce memory use
   def build_apk(pr_number:)
-    # Read package.json
-    package_json_path = File.expand_path("../../../package.json", __dir__)
-    UI.user_error!("❌ package.json not found at #{package_json_path}") unless File.exist?(package_json_path)
-
-    package_json = JSON.parse(File.read(package_json_path))
-    version = package_json["version"]
-    UI.user_error!("❌ Version not found in package.json") unless version
-
-    major, minor, patch = version.split('.').map(&:to_i)
-    # Include PR number in version code for guaranteed uniqueness across concurrent PRs
-    # Format: (major * 1000000) + (minor * 10000) + (patch * 100) + pr_number
-    # This allows up to 99 PRs per version, 99 patches per minor, etc.
-    # Example: version 1.0.2, PR #5 → version_code = 1000205
-    version_code = (major * 1000000) + (minor * 10000) + (patch * 100) + pr_number.to_i
+    # For PR preview builds, use PR number directly for version code
+    # This ensures unique builds without depending on package.json version
+    # Format: 1000000 + pr_number (ensures PR builds are > 1M, distinct from production)
+    # Example: PR #5 → version_code = 1000005, PR #123 → version_code = 1000123
+    version_code = 1000000 + pr_number.to_i
+    
+    # For display, use PR-based version string
+    version = "0.0.0-pr#{pr_number}"
 
     ENV["GRADLE_OPTS"] = "-Xmx6g -XX:MaxMetaspaceSize=2g -Dfile.encoding=UTF-8"
 
